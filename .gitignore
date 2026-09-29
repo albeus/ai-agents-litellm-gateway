@@ -1,0 +1,10 @@
+.env
+*.pem
+*key*.json
+*token*
+kubeconfig*
+*.jsonl
+!*.jsonl.example
+pgdata/
+__pycache__/
+.venv/

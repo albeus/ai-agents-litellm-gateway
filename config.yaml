@@ -1,0 +1,19 @@
+model_list:
+  - model_name: qwen3-local
+    litellm_params:
+      model: ollama_chat/qwen3:8b
+      api_base: http://host.docker.internal:11434
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: true
+  supported_db_objects: ["mcp"]
+
+mcp_servers:
+  itsops:
+    url: "http://host.docker.internal:8000/mcp"
+    transport: "http"
+    description: "Read-only ITS Operations lab tools"
+    allow_all_keys: false
+    access_groups: ["itsops-group"]
