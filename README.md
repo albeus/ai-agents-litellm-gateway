@@ -30,8 +30,8 @@ curl / client
      ▼
 LiteLLM Proxy (Podman, 127.0.0.1:4000)
  ├── model_list          → Ollama (host, qwen3:8b)      via host.docker.internal:11434
- └── mcp_servers.itsops  → mcp-itsops (host, :8000)     via host.docker.internal:8000
-                           (Streamable HTTP, stateless, MCP spec 2026-07-28)
+ └── mcp_servers.itsops  → mcp-itsops (host, :8000)     via host.docker.internal:8000/mcp
+                           (Streamable HTTP, stateless; recorded MCP revision 2026-07-28)
 PostgreSQL (Podman) ── stores virtual keys, teams, object permissions, spend
 ```
 
@@ -42,6 +42,8 @@ Two teams, both allowed to use the model `qwen3-local`:
 | `itsops` | ITS Operations tooling | `itsops` MCP server: `search_runbooks`, `host_health`, `k8s_pod_status` |
 | `servicedesk` | Service Desk chat | None |
 
+The current server also exposes the lab-only `slow_probe` tool for timeout/tracing tests. The recorded gateway results below concern the earlier three-tool configuration; they do not establish access control for this additional tool.
+
 ## Repository contents
 
 ```text
@@ -51,20 +53,24 @@ config.yaml             # model_list, mcp_servers, general_settings
 .gitignore              # excludes .env, secrets/ and database volumes
 ```
 
-The MCP server lives in the sibling repository [`ai-agents-mcp-itsops`](https://github.com/albeus/ai-agents-mcp-itsops). The tutorial below adds an HTTP mode to it; see [Step 4](#4-expose-the-mcp-server-over-streamable-http).
+The MCP server lives in the sibling repository [`ai-agents-mcp-itsops`](https://github.com/albeus/ai-agents-mcp-itsops). It now defaults to stdio; this lab explicitly selects its HTTP mode through environment variables. See [Step 4](#4-expose-the-mcp-server-over-streamable-http).
 
 ## Tutorial (what was done, in order)
+
+The startup instructions reflect the transport switch added during the lab review. The results and known issue below remain the recorded outcomes of the original gateway experiment, not a claim that the whole experiment has been retested.
 
 ### 1. Prerequisites
 
 - Podman with Compose (Docker Compose also works).
 - Ollama with `qwen3:8b` pulled.
-- The `mcp-itsops` project (`uv` and the MCP Python SDK) with its three read-only-style tools.
+- The `mcp-itsops` project (`uv` and the MCP Python SDK) with its narrow operations tools and environment-variable transport switch.
 - `curl` and `jq`.
+
+Run the gateway commands from this repository's root. Run the MCP server commands in a separate terminal from the `ai-agents-mcp-itsops` repository root, after `uv sync`.
 
 ### 2. Make Ollama reachable from containers
 
-By default Ollama binds to `127.0.0.1`, which containers cannot reach. Adding an override changes the address it listens on:
+In this lab setup, Ollama's loopback listener was not reachable from the container. Adding an override changes the address it listens on:
 
 ```bash
 sudo systemctl edit ollama.service
@@ -79,7 +85,7 @@ Environment="OLLAMA_HOST=0.0.0.0:11434"
 sudo systemctl daemon-reload && sudo systemctl restart ollama
 ```
 
-This exposes Ollama on all interfaces. Restrict access with a host firewall, and revert the override when you finish.
+This exposes Ollama on all IPv4 interfaces. Restrict access with a host firewall, and revert the override when you finish.
 
 ### 3. Start LiteLLM and PostgreSQL
 
@@ -123,26 +129,33 @@ podman compose logs -f db litellm
 
 ### 4. Expose the MCP server over Streamable HTTP
 
-In `mcp_itsops/server.py` the transport is set in the `run()` call:
+The server defaults to stdio. Running it without a transport override will not create the HTTP endpoint LiteLLM needs.
 
-```python
-mcp = MCPServer("ITS Operations")
-
-if __name__ == "__main__":
-    mcp.run(
-        transport="streamable-http",
-        host="0.0.0.0",   # use 127.0.0.1 while testing from the same host;
-        port=8000,        # 0.0.0.0 was needed so the LiteLLM container could reach it
-        stateless_http=True,
-        json_response=True,
-    )
-```
+In a separate terminal, from the MCP server repository root:
 
 ```bash
+MCP_TRANSPORT=streamable-http \
+MCP_HOST=0.0.0.0 \
+MCP_PORT=8000 \
 uv run python -m mcp_itsops.server
 ```
 
-The MCP specification version used here, 2026-07-28, dropped `initialize`: every request carries the protocol version and capabilities in `params._meta`. A minimal `tools/list` request:
+Keep this process running while using the gateway. HTTP mode uses `stateless_http=True` and `json_response=True`. LiteLLM connects to `http://host.docker.internal:8000/mcp` from inside its container. The SDK transport value (`streamable-http`) and LiteLLM's configuration value (`http`) are different settings; keep each as shown.
+
+For same-host testing without the gateway container, use a loopback bind instead:
+
+```bash
+MCP_TRANSPORT=streamable-http \
+MCP_HOST=127.0.0.1 \
+MCP_PORT=8000 \
+uv run python -m mcp_itsops.server
+```
+
+Run only one of these server commands on port 8000 at a time. This server has no authentication. Firewall the wider bind and stop it when you finish; direct access bypasses any gateway policy.
+
+#### Direct HTTP check from the host
+
+The original lab recorded the MCP revision `2026-07-28` and this per-request `_meta` envelope. Keep this example tied to that recorded SDK/protocol environment; it is not a universal request format for every MCP version.
 
 ```bash
 curl -sS http://127.0.0.1:8000/mcp \
@@ -154,7 +167,25 @@ curl -sS http://127.0.0.1:8000/mcp \
         "io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
-This server has no authentication. Bind it to loopback unless a container has to reach it, and firewall it if you bind wider.
+This checks the server directly from the host. It does not prove container reachability or gateway authorisation. If it fails after dependency changes, check the installed SDK and protocol revision before changing the tool implementations.
+
+#### Optional Inspector check
+
+With the HTTP server already running, start Inspector in another terminal:
+
+```bash
+npx @modelcontextprotocol/inspector
+```
+
+Open the URL Inspector prints, select **Streamable HTTP**, enter `http://127.0.0.1:8000/mcp` and connect. Use the proxy connection mode if offered. This checks the server directly, not the LiteLLM route.
+
+For the separate stdio exercise, stop the HTTP process if no longer needed and let Inspector launch a stdio server from the MCP repository root:
+
+```bash
+MCP_TRANSPORT=stdio \
+npx @modelcontextprotocol/inspector \
+  uv run python -m mcp_itsops.server
+```
 
 ### 5. Create teams and keys
 
@@ -191,7 +222,7 @@ curl -sS http://127.0.0.1:4000/v1/chat/completions \
   -d '{"model":"qwen3-local","messages":[{"role":"user","content":"Reply with exactly: ITS team policy working"}],"temperature":0}'
 ```
 
-Repeat with the `servicedesk` key. Both keys reached `qwen3-local`.
+Repeat with the `servicedesk` key. In the recorded experiment, both keys reached `qwen3-local`. The requested reply text is not itself evidence of policy enforcement; the relevant observation is successful routing with each key.
 
 ### 7. Register the MCP server and test tool access
 
@@ -204,7 +235,7 @@ curl -sS http://127.0.0.1:4000/mcp-rest/tools/list \
   -H "x-mcp-servers: itsops" | jq
 ```
 
-The master key listed all three tools. A team-scoped key could not, and neither could any other non-master key. That is the open problem described below.
+The original experiment's master key listed all three operations tools. Team-scoped and other non-master keys tested could not. That is the open problem described below. The current source also includes `slow_probe`; check the current tool list when repeating the experiment rather than expecting the historical count of three.
 
 ## Results
 
@@ -225,19 +256,19 @@ SELECT * FROM "LiteLLM_ObjectPermissionTable" WHERE object_permission_id = '<id>
 -- mcp_servers, mcp_access_groups, vector_stores and agents were all empty
 ```
 
-The permission row existed and was linked to the key, but the grant fields inside it were empty, on both the key-level and team-level paths tried. As a result every non-master-key request to `/mcp-rest/tools/list` returned `403 access_denied`, for both teams. That is a fail-closed outcome, so it was safe, but it means the intended access policy could not be demonstrated.
+The permission row existed and was linked to the key, but the grant fields inside it were empty, on both the key-level and team-level paths tried. As a result every non-master-key request tested against `/mcp-rest/tools/list` returned `403 access_denied`, for both teams. This was fail-closed for those requests, but it means the intended access policy could not be demonstrated.
 
 **Ruled out.**
 
 - A network problem: the `x-mcp-debug-*` response headers confirmed the correct upstream URL was reached.
 - A header-naming problem: correcting the headers (`x-litellm-api-key`, `x-mcp-servers`) changed nothing once the permission row was seen to be empty.
 - An MCP-server-side problem: the master key listed all three tools through the same route.
-- A display-only quirk: a known LiteLLM behaviour shows `object_permission: null` in key responses even on success, but here the database itself showed empty grant columns.
+- A display-only quirk: the lab notes mention a LiteLLM behaviour showing `object_permission: null` in key responses even on success, but here the database itself showed empty grant columns.
 
 **Not yet tried.**
 
 1. Check the installed LiteLLM version against the project's issue tracker for `object_permission` persistence problems.
-2. Set the permission through the Admin UI (`http://127.0.0.1:4000/ui`), in case the fault is specific to the REST path.
+2. Set the permission through the [Admin UI](http://127.0.0.1:4000/ui), in case the fault is specific to the REST path.
 3. Attach the team to the MCP server through the server's own `teams` field instead of granting the server to the team.
 4. Pin a specific release tag and retest.
 
@@ -245,31 +276,37 @@ Treat the result as a finding about this build and this configuration, not as a 
 
 ## Troubleshooting log
 
-| Symptom | Cause | Fix |
+The protocol-specific rows below describe the recorded environment, not all SDK releases.
+
+| Symptom | Cause or check | Fix |
 | --- | --- | --- |
-| `Cannot connect to host host.docker.internal:11434` | Ollama bound to `127.0.0.1` only | Set `OLLAMA_HOST=0.0.0.0:11434` with a systemd override and restart |
+| `Cannot connect to host host.docker.internal:11434` | Ollama bound to `127.0.0.1` only in this lab setup | Set `OLLAMA_HOST=0.0.0.0:11434` with a systemd override and restrict network access |
+| LiteLLM cannot reach MCP on port 8000 | Server may be running in default stdio mode or bound only to loopback | Set `MCP_TRANSPORT=streamable-http` and the container-reachable `MCP_HOST`; check firewall and host mapping |
+| Inspector's stdio connection hangs | Child server is running in HTTP mode | Launch Inspector with `MCP_TRANSPORT=stdio`, or connect its HTTP UI to the separately started server |
 | `DB not connected` on `/key/generate` | Virtual keys and teams need PostgreSQL | Add the `db` service, set `DATABASE_URL` and `store_model_in_db: true` |
-| `Method Not Allowed` when calling `/team/update` with `PATCH` | The route accepts `POST` | Use `POST /team/update` |
-| `Failed to spawn: mcp` | `uv run mcp run <file>` needs the `mcp` CLI, and the filename was wrong | Use `uv run python -m mcp_itsops.server` with the transport set in code |
-| `TypeError` on `stateless_http` in the `MCPServer(...)` constructor | In this SDK version the option belongs to `run()` | Move `stateless_http` and `json_response` into `mcp.run(...)` |
-| `400 Bad Request: Missing session ID` on a plain `GET /mcp` | A bare GET is not a valid MCP operation | Use stateless mode and proper POST requests |
-| `params._meta must be an object ...` | Spec 2026-07-28 retired `initialize`; each request needs `_meta` | Send the full `_meta` envelope with version and capabilities |
-| `406 Not Acceptable` | The endpoint needs both content types accepted | Send `Accept: application/json, text/event-stream` as one header |
-| `403 access_denied: key not allowed to access any MCP servers` | The grants were not persisted (see Known issue) | Diagnosed by querying PostgreSQL directly |
+| `Method Not Allowed` when calling `/team/update` with `PATCH` | The recorded route accepts `POST` | Use `POST /team/update` |
+| `Failed to spawn: mcp` | `uv run mcp run <file>` needed the `mcp` CLI, and the filename was wrong | Use `uv run python -m mcp_itsops.server` with the explicit HTTP environment settings from Step 4 |
+| `TypeError` on `stateless_http` in the `MCPServer(...)` constructor | In the recorded SDK version the option belongs to `run()` | Keep `stateless_http` and `json_response` in the HTTP `mcp.run(...)` branch |
+| `400 Bad Request: Missing session ID` on a plain `GET /mcp` | A bare GET did not perform the required MCP exchange in the recorded setup | Use a compatible MCP client or the documented POST test for that environment |
+| `params._meta must be an object ...` | The recorded 2026-07-28 environment expected per-request `_meta` | Use the recorded envelope, or verify the request format for your installed SDK/protocol revision |
+| `406 Not Acceptable` | The recorded endpoint needed both content types accepted | Send `Accept: application/json, text/event-stream` as one header |
+| `403 access_denied: key not allowed to access any MCP servers` | The grants were not persisted (see Known issue) | Diagnose stored permissions in PostgreSQL; changing transport does not establish policy enforcement |
 
 ## What this lab did show
 
 - LiteLLM as a single OpenAI-compatible gateway in front of a local Ollama model.
 - PostgreSQL-backed storage for virtual keys, teams and spend.
-- Per-team **model** access, verified with two team identities.
-- A custom MCP server moved from stdio to stateless Streamable HTTP under the 2026-07-28 spec, registered as a LiteLLM upstream and queried through the gateway with the master key.
+- Successful model routing with two team identities.
+- A custom MCP server exercised over stateless Streamable HTTP in the recorded 2026-07-28 protocol environment, registered as a LiteLLM upstream and queried through the gateway with the master key.
 
 What it did **not** show is per-team MCP tool authorisation. A useful takeaway is the method: verify stored policy in the database, not only in the API response.
 
+The server now supports both stdio and HTTP startup workflows. This documentation update does not claim a new gateway authorisation result.
+
 ## Related
 
-- [`ai-agents-mcp-itsops`](https://github.com/albeus/ai-agents-mcp-itsops): the MCP server behind this gateway.
-- [`ai-agents-trace-probe`](https://github.com/albeus/ai-agents-trace-probe): a probe that calls the model through this proxy.
+- [`ai-agents-mcp-itsops`](https://github.com/albeus/ai-agents-mcp-itsops): the server behind this gateway, including stdio and HTTP Inspector workflows.
+- [`ai-agents-trace-probe`](https://github.com/albeus/ai-agents-trace-probe): a probe that calls the model through this proxy and the MCP server directly.
 - [Lab index](https://github.com/albeus/ai-agents-lab): reading order and the other projects.
 
 ## Licence
